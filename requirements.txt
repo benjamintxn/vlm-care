@@ -1,0 +1,14 @@
+torch>=2.2
+torchvision>=0.17
+transformers>=4.41
+streamlit
+fastapi[all]
+opencv-python
+scikit-fuzzy
+wandb
+pillow
+numpy 
+pandas
+scikit-learn
+scipy
+matplotlib

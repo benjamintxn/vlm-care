@@ -1,0 +1,87 @@
+# Python specific
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.env
+*.venv
+env/
+venv/
+ENV/
+*.egg-info/
+dist/
+build/
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+
+# macOS specific
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Logs and databases
+*.log
+*.sqlite3
+
+# IDE specific
+.vscode/
+.idea/
+*.sublime-workspace
+*.sublime-project
+
+# Temporary files
+*.tmp
+*.swp
+*.bak
+*.orig
+*.~lock.*
+
+# Node.js specific
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Other
+*.iml
+*.class
+*.jar
+*.war
+*.ear
+*.swp
+*.swo
+*.out
+*.exe
+*.dll
+*.obj
+*.o
+*.a
+*.so
+*.lib
+*.dylib
+*.ncb
+*.sdf
+*.suo
+*.pdb
+*.idb
+*.class
+*.psd
+*.db
+*.tgz
+*.7z
+*.zip
+*.tar
+*.gz
+*.rar
+*.iso
+*.dmg
+*.pkg
+*.deb
+*.rpm
+*.bak
+*.old
+*.orig
+*.rej
+*.patch
+*.diff
