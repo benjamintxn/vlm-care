@@ -12,12 +12,12 @@ import matplotlib.pyplot as plt
 import sys
 
 ############### Global Parameters ###############
-train_path = './dataset/features/training/'
-test_path = './dataset/features/testing/'
-demo_path = './dataset/features/testing/'
-default_model_path = './model/demo_model'
+train_path = './data/features/training/'
+test_path = './data/features/testing/'
+demo_path = './data/external/demo_model'
+default_model_path = './data/external/demo_model'
 save_path = './model/'
-video_path = './dataset/videos/testing/positive/'
+video_path = './data/videos/testing/positive/'
 train_num = 128  # Updated batch count
 test_num = 46
 

@@ -1,162 +1,211 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
 # ---------------------------------------------------------------------
-# Overlay per-frame accident risk on dash-cam video using the training graph
+# Overlay the per–time-step accident risk produced by accident.py
+# on top of a dash-cam video, writing out a new .mp4 clip.
+#
 # Usage:
-#   python new_overlay_risk.py INPUT.mp4 OUTPUT.mp4 --model MODEL_DIR_OR_PREFIX --gpu 0
+#   python overlay_risk.py \
+#       ./dataset/videos/testing/positive/000469.mp4 \
+#       ./output/000469_with_risk.mp4 \
+#       --model ./model/demo_model            # or a checkpoint dir
+#       --gpu   0
 # ---------------------------------------------------------------------
 import os, glob, argparse
 import cv2
 import numpy as np
 import tensorflow.compat.v1 as tf
-from accident import build_model  # ensure this points to your trained graph definition
 
-tf.disable_v2_behavior()
-FEATURE_DIR = "./data/annotated_batches/testing/"
+tf.disable_v2_behavior()          # keep TF-1 semantics
+
+# ------------- project-specific paths --------------------------------
+FEATURE_DIR = "./data/features/testing/"   # *.npz files
 N_CLASSES   = 2
-GRAPH_H     = 150
+GRAPH_H     = 150                             # pixels for risk panel
+# ---------------------------------------------------------------------
+
 
 # ---------------------------------------------------------------------
-# Find feature batch containing this video
+# Helper: locate which batch_XXX.npz contains this video’s features
 # ---------------------------------------------------------------------
-def find_feature_file(video_id, root=FEATURE_DIR):
-    # search recursively in positive/negative subfolders
-    pattern = os.path.join(root, '**', 'batch_*.npz')
-    for path in sorted(glob.glob(pattern, recursive=True)):
-        with np.load(path, allow_pickle=True) as data:
-            ids = [i.decode() if isinstance(i, (bytes, bytearray)) else str(i)
-                   for i in data['ID']]
+def find_feature_file(video_id: str, root: str = FEATURE_DIR):
+    """
+    Return (npz_path, index_in_batch) or (None, None) if not found.
+    """
+    for npz_path in sorted(glob.glob(os.path.join(root, "batch_*.npz"))):
+        with np.load(npz_path, allow_pickle=True) as data:
+            ids = [i.decode("utf-8") if isinstance(i, (bytes, bytearray)) else str(i)
+                   for i in data["ID"]]
             if video_id in ids:
-                return path, ids.index(video_id)
+                return npz_path, ids.index(video_id)
     return None, None
 
-# ---------------------------------------------------------------------
-# Command-line arguments
-# ---------------------------------------------------------------------
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Overlay per-frame risk on a dash-cam video"
-    )
-    parser.add_argument('video',  help='Path to input MP4')
-    parser.add_argument('output', help='Path to output MP4')
-    parser.add_argument('--model', default='./model',
-                        help='Checkpoint directory or prefix')
-    parser.add_argument('--gpu', default='0',
-                        help='CUDA_VISIBLE_DEVICES')
-    return parser.parse_args()
 
 # ---------------------------------------------------------------------
-# Main function
+def parse_args():
+    ap = argparse.ArgumentParser("Overlay accident‐risk curve on a video")
+    ap.add_argument("video",  help="input .mp4 path")
+    ap.add_argument("output", help="output .mp4 path")
+    ap.add_argument("--model", default="./model/demo_model",
+                    help="checkpoint prefix OR directory (demo_model, final_model, …)")
+    ap.add_argument("--gpu",   default="0", help="CUDA_VISIBLE_DEVICES id")
+    ap.add_argument("--new_arch", action="store_true",
+                    help="Use the upgraded geometry+velocity network "
+                         "(checkpoint trained with new_accident.py)")
+    return ap.parse_args()
+
+
 # ---------------------------------------------------------------------
 def main():
     args = parse_args()
-    os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
+    os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
 
-    # 1) Build the graph as in training
-    x_ph, keep_ph, y_ph, attn_ph, _, _, soft_pred, _ = build_model()
+    # choose the correct graph
+    if args.new_arch:
+        from new_accident import build_model as _build
+        NEW = True
+    else:
+        from accident import build_model as _build
+        NEW = False
 
-    # 2) Prepare saver: only restore variables present in checkpoint
+    outs = _build()                 # tensors list (old = 8, new = 9)
+
+    soft_pred = outs[-2]            # ← second-to-last is always soft_pred
+
+    # correct index for keep_ph
+    keep_ph = outs[4] if NEW else outs[1]
+
+    if NEW:                          # 9-tensor signature
+        x_fc7, x_geom, x_vel = outs[0:3]
+        y_ph                 = outs[3]
+    else:                            # 8-tensor signature
+        x_fc7                = outs[0]
+        x_geom = x_vel       = None
+        y_ph                 = outs[2]
+
+    saver = tf.train.Saver()
+    sess  = tf.Session(config=tf.ConfigProto(
+            gpu_options=tf.GPUOptions(allow_growth=True)))
+
     ckpt = args.model
     if os.path.isdir(ckpt):
         ckpt = tf.train.latest_checkpoint(ckpt)
         if ckpt is None:
-            raise FileNotFoundError(f"No checkpoint found in {args.model}")
-    ckpt_vars = {name for name, _ in tf.train.list_variables(ckpt)}
-    var_list  = [v for v in tf.global_variables() if v.op.name in ckpt_vars]
-    saver     = tf.train.Saver(var_list=var_list)
-
-    # 3) Create session, init all, then restore
-    sess = tf.Session(config=tf.ConfigProto(
-        gpu_options=tf.GPUOptions(allow_growth=True)
-    ))
-    sess.run(tf.global_variables_initializer())
+            raise FileNotFoundError(f"No checkpoint found in dir {args.model}")
     saver.restore(sess, ckpt)
-    print(f"✓ Initialized and restored {len(var_list)} vars from {ckpt}")
+    print("✓ Restored weights from", ckpt)
 
-    # 4) Load feature batch for the given video
-    vid = os.path.splitext(os.path.basename(args.video))[0]
-    npz_path, idx = find_feature_file(vid)
+    # ----------------------------------------------------------
+    # 2. Load the feature batch containing this video
+    # ----------------------------------------------------------
+    vid_path  = args.video
+    vid_id    = os.path.splitext(os.path.basename(vid_path))[0]
+
+    npz_path, idx_in_batch = find_feature_file(vid_id)
     if npz_path is None:
-        raise FileNotFoundError(f"No feature batch found for video ID {vid}")
-    print(f"✓ Loaded features from {npz_path}")
+        raise FileNotFoundError(f"Features for video ID {vid_id} not found in {FEATURE_DIR}")
+    print("✓ Using feature file:", npz_path)
 
-    data = np.load(npz_path, allow_pickle=True)
-    feat_batch = data['data']  # shape: (B, N_FRAMES, N_DET, N_INPUT)
+    with np.load(npz_path, allow_pickle=True) as npz:
+        feat_batch = npz["data"]                       # (batch, 100, 20, 4096)
 
-        # 5) Run inference to get risk curve
-    risk_batch = sess.run(soft_pred, feed_dict=feed)
-    print("Risk batch shape:", risk_batch.shape)
-    print("Sample risk values:", np.round(risk_batch[idx, :10], 3))
+    # dummy labels just to satisfy the placeholder
+    dummy_y = np.zeros((feat_batch.shape[0], N_CLASSES), np.float32)
 
-    # Normalize so that 0% risk is baseline at bottom of panel
-    raw_curve = risk_batch[idx]
-    min_val = raw_curve.min()
-    norm_curve = raw_curve - min_val
-    max_val = norm_curve.max()
-    if max_val > 0:
-        norm_curve = norm_curve / max_val
-    risk_curve = norm_curve
-    print("Normalized risk sample:", np.round(risk_curve[:10], 3))
+    # ----------------------------------------------------------
+    # 3. Run inference once to obtain the 100-step risk curve
+    # ----------------------------------------------------------
+    if NEW:
+        with np.load(npz_path, allow_pickle=True) as npz:
+            det_raw = npz["det"].astype("float32")
 
-        # Optional: smooth the normalized risk curve to reduce spikiness
-    # Simple moving average with window size w
-    w = 5
-    kernel = np.ones(w) / w
-    risk_curve = np.convolve(risk_curve, kernel, mode='same')
+        # build geom & vel exactly like new_accident.load_npz_batch
+        if det_raw.shape[2] == 19:
+            B,T,_,_ = det_raw.shape
+            det = np.concatenate([np.zeros((B,T,1,6), det_raw.dtype), det_raw], axis=2)
+        else:
+            det = det_raw
+        x0,y0,x1,y1 = det[...,0], det[...,1], det[...,2], det[...,3]
+        w = np.maximum(x1-x0,1);  h = np.maximum(y1-y0,1)
+        geom_batch = np.stack([x0,y0,w,h], axis=-1)
+        cx = 0.5*(x0+x1);  cy = 0.5*(y0+y1)
+        d_cx = np.diff(cx, axis=1, prepend=cx[:,:1])
+        d_cy = np.diff(cy, axis=1, prepend=cy[:,:1])
+        vel_batch = np.stack([d_cx,d_cy], axis=-1)
 
-    # 6) Open video and setup writer
-    cap = cv2.VideoCapture(args.video)
+    # ---------- build feed dict & run ----------
+    feed = {x_fc7: feat_batch,
+            keep_ph: [0.0],
+            y_ph:    np.zeros((feat_batch.shape[0], N_CLASSES), np.float32)}
+
+    if NEW:
+        feed.update({x_geom: geom_batch,
+                    x_vel:  vel_batch})
+
+    risk_batch = sess.run(soft_pred, feed_dict=feed)   # (batch,100)
+    risk_curve = risk_batch[idx_in_batch]  
+    # ----------------------------------------------------------
+    # 4. Prepare video I/O
+    # ----------------------------------------------------------
+    cap = cv2.VideoCapture(vid_path)
     if not cap.isOpened():
-        raise IOError(f"Cannot open video {args.video}")
-    fps   = cap.get(cv2.CAP_PROP_FPS)
-    w     = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    h     = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        raise IOError(f"Cannot open video {vid_path}")
 
-    # stretch curve if different length
-    if total != len(risk_curve):
-        xs = np.linspace(0, 1, len(risk_curve))
-        xd = np.linspace(0, 1, total)
-        risk_curve = np.interp(xd, xs, risk_curve)
+    fps  = cap.get(cv2.CAP_PROP_FPS)
+    w    = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h    = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    total_vis_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-    writer = cv2.VideoWriter(
-        args.output,
-        cv2.VideoWriter_fourcc(*'mp4v'),
-        fps,
-        (w, h + GRAPH_H)
-    )
-    print(f"✓ Writing overlay to {args.output}")
+    # If the raw video is longer than 100 frames, just stretch the curve
+    if total_vis_frames != len(risk_curve):
+        xs_src = np.linspace(0, 1, len(risk_curve))
+        xs_dst = np.linspace(0, 1, total_vis_frames)
+        risk_curve = np.interp(xs_dst, xs_src, risk_curve)
 
-    # 7) Draw frames with overlay
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    out    = cv2.VideoWriter(args.output, fourcc, fps, (w, h + GRAPH_H))
+    print("✓ Writing overlay to", args.output)
+
+    # ----------------------------------------------------------
+    # 5. Frame-by-frame overlay
+    # ----------------------------------------------------------
     frame_idx = 0
     while True:
         ret, frame = cap.read()
         if not ret or frame_idx >= len(risk_curve):
             break
 
+        # ---- draw risk panel --------------------------------
         panel = np.zeros((GRAPH_H, w, 3), np.uint8)
-        # draw axes
+
+        # axes
         cv2.line(panel, (0, GRAPH_H-1), (w, GRAPH_H-1), (200,200,200), 1)
         cv2.line(panel, (0, 0), (0, GRAPH_H-1), (200,200,200), 1)
-        # threshold at 0.5
+
+        # threshold = 0.5
         y_th = GRAPH_H-1 - int(0.5 * (GRAPH_H-1))
         cv2.line(panel, (0, y_th), (w, y_th), (100,100,100), 1)
-        # risk polyline
+
+        # current curve
         pts = [(
             int(i * w / len(risk_curve)),
-            GRAPH_H-1 - int(risk_curve[i] * (GRAPH_H-1))
-        ) for i in range(frame_idx+1)]
+            GRAPH_H-1 - int(r * (GRAPH_H-1))
+        ) for i, r in enumerate(risk_curve[:frame_idx+1])]
         if len(pts) > 1:
             cv2.polylines(panel, [np.array(pts)], False, (0,0,255), 2)
+
         cv2.putText(panel, "Risk", (5,15), cv2.FONT_HERSHEY_SIMPLEX,
                     0.6, (0,255,255), 2)
 
+        # ---- stack & write ----------------------------------
         out_frame = np.vstack((frame, panel))
-        writer.write(out_frame)
+        out.write(out_frame)
+
         frame_idx += 1
 
     cap.release()
-    writer.release()
-    print("✓ Finished overlay")
+    out.release()
+    print("✓ Finished!")
 
-if __name__ == '__main__':
+# ---------------------------------------------------------------------
+if __name__ == "__main__":
     main()

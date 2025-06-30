@@ -1,166 +1,161 @@
 #!/usr/bin/env python3
 """
-Peak-frame crop + InstructBLIP deep caption with improved input quality.
+multi_frame_caption.py
+──────────────────────
+1. Find peak-risk frame  t  from <track_stats>.csv
+2. Grab six frames  [t-5, t-3, t(crop), t(full), t+3, t+5]
+3. Caption each with InstructBLIP using role-specific prompts
+4. If peak-risk < THRESH or captions say "no accident" → stop.
+5. Else send captions to an LLM to get final driver advice.
 
-Example
--------
-python src/new_crop_and_caption.py \
-    data/raw/videos/testing/positive/000469.mp4 \
-    outputs/track_stats_000469.csv \
-    outputs/risk_logs_000469.csv \
-    --enlarge 1.5 --pad 20 \
-    --prompt "Let’s think step by step: identify objects, trajectories, collision point, contextual factors, and mitigation strategies." \
-    --full                # feed entire frame instead of cropping
+USAGE
+─────
+python multi_frame_caption.py \
+       <video>.mp4  <track_stats>.csv  <risk_logs>.csv \
+       --peak_dir outputs/peak_frames \
+       --caption_dir outputs/captions \
+       --risk_thresh 0.4 \
+       --openai_key $OPENAI_API_KEY
 """
-import os
-import argparse
-import cv2
-import pandas as pd
-import torch
-import numpy as np
-from PIL import Image
-from transformers import (
-    InstructBlipProcessor,
-    InstructBlipForConditionalGeneration
-)
 
+import os, argparse, re, json, time
+import numpy as np, pandas as pd, cv2, torch, openai
+from PIL import Image
+from transformers import InstructBlipProcessor, InstructBlipForConditionalGeneration
+
+# ──────────────────────────────── CLI ────────────────────────────────
 def parse_args():
-    p = argparse.ArgumentParser("Peak-frame crop + InstructBLIP deep caption")
-    p.add_argument("video", help="Path to input video")
-    p.add_argument("track_stats", help="CSV with per-track stats")
-    p.add_argument("risk_logs", help="CSV with per-frame attention & bboxes")
-    p.add_argument("--output_dir", default="outputs",
-                   help="Where to save the frames and captions")
-    p.add_argument("--vlm_model",
-                   default="Salesforce/instructblip-flan-t5-xxl",
-                   help="InstructBLIP checkpoint (flan-t5-xxl, opt-2.7b, …)")
-    p.add_argument("--prompt",
-        default=(
-            "Let’s think step by step:\n"
-            "1) Identify all objects and their directions.\n"
-            "2) Describe any trajectory intersections.\n"
-            "3) Explain contextual factors (e.g. speed, environment).\n"
-            "4) Summarize potential outcomes and avoidance measures."
-        ),
-        help="Deep reasoning prompt for the VLM"
-    )
-    p.add_argument("--full", action="store_true",
-                   help="Use the full frame instead of cropping")
-    p.add_argument("--enlarge", type=float, default=1.0,
-                   help="Scale bbox about its center (1.0=no scale, >1 adds context)")
-    p.add_argument("--pad", type=int, default=0,
-                   help="Extra pixel padding around the scaled box")
+    p = argparse.ArgumentParser("Multi-frame caption + advice")
+    p.add_argument("video"); p.add_argument("track_stats"); p.add_argument("risk_logs")
+    p.add_argument("--peak_dir",    default="outputs/peak_frames")
+    p.add_argument("--caption_dir", default="outputs/captions")
+    p.add_argument("--vlm_model",   default="Salesforce/instructblip-flan-t5-xxl")
+    p.add_argument("--risk_thresh", type=float, default=0.4,
+                   help="Skip LLM if peak risk below this")
+    p.add_argument("--openai_key",  default=None,
+                   help="If set, use ChatGPT for the advice step")
+    p.add_argument("--gpt_model",   default="gpt-3.5-turbo")
     return p.parse_args()
 
-def expand_box(x0, y0, x1, y1, scale, W, H):
-    cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
-    bw, bh = (x1 - x0) * scale, (y1 - y0) * scale
-    nx0 = max(0, int(cx - bw/2))
-    ny0 = max(0, int(cy - bh/2))
-    nx1 = min(W-1, int(cx + bw/2))
-    ny1 = min(H-1, int(cy + bh/2))
-    return nx0, ny0, nx1, ny1
+# ---------------- helper ------------------------------------------------
+OFFSETS = [-5, -3, 0, 0, +3, +5]        # frames relative to peak
+ROLE    = ["pre", "pre", "peak-crop", "peak-full", "post", "post"]
 
-def sharpen_image(img_np: np.ndarray) -> np.ndarray:
-    kernel = np.array([[0, -1, 0],
-                       [-1, 5, -1],
-                       [0, -1, 0]])
-    return cv2.filter2D(img_np, -1, kernel)
+def build_prompt(role, risk):
+    risk_pct = f"{risk:.2f}"
+    if role == "pre":
+        return (f"The risk in this frame is {risk_pct}. "
+                "Can you anticipate an accident occurring here? "
+                "If so, describe in detail how it might happen.")
+    if role.startswith("peak"):
+        return (f"The peak risk in this frame is {risk_pct}. "
+                "Is a collision occurring?  Describe it in detail.")
+    return (f"The risk in this frame is {risk_pct}. "
+            "Has an accident already happened?  If so, describe it in detail.")
 
-def upscale_crop(crop: np.ndarray, factor: float = 2.0) -> np.ndarray:
-    h, w = crop.shape[:2]
-    return cv2.resize(crop, (int(w*factor), int(h*factor)),
-                      interpolation=cv2.INTER_CUBIC)
+def is_negative_caption(txt):
+    """very loose heuristic → True iff caption *explicitly* denies accident"""
+    neg = re.search(r"\b(no accident|no collision|nothing .*? happen)", txt, re.I)
+    return bool(neg)
 
+# ───────────────────────────── main ────────────────────────────────────
 def main():
     args = parse_args()
-    peak_dir = os.path.join(args.output_dir, "peak_frames")
-    cap_dir  = os.path.join(args.output_dir, "captions")
-    os.makedirs(peak_dir, exist_ok=True)
-    os.makedirs(cap_dir, exist_ok=True)
+    os.makedirs(args.peak_dir,    exist_ok=True)
+    os.makedirs(args.caption_dir, exist_ok=True)
 
-    # 1) pick the peak frame
+    # 1) peak frame & score
     stats = pd.read_csv(args.track_stats)
-    best  = stats.loc[stats.peak_score.idxmax()]
-    pf, ps = int(best.peak_frame), float(best.peak_score)
-    print(f"[+] Track {best.track_id} peaks at frame {pf} (score={ps:.3f})")
+    peak  = stats.loc[stats.peak_score.idxmax()]
+    t     = int(peak.peak_frame);   peak_score = float(peak.peak_score)
 
-    # 2) load that frame
-    cap = cv2.VideoCapture(args.video)
-    cap.set(cv2.CAP_PROP_POS_FRAMES, pf)
-    ok, frame = cap.read()
+    # full risk curve for quick lookup
+    curve = pd.read_csv(args.risk_logs).set_index("frame")["risk"]
+
+    # 2) open video once
+    cap = cv2.VideoCapture(args.video);   H = int(cap.get(4));  W = int(cap.get(3))
+
+    # 3) prepare VLM
+    dev  = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    proc = InstructBlipProcessor.from_pretrained(args.vlm_model, use_fast=True)
+    model= InstructBlipForConditionalGeneration.from_pretrained(
+               args.vlm_model,
+               device_map="auto" if dev.type=="cuda" else None,
+               torch_dtype=torch.float16 if dev.type=="cuda" else torch.float32)
+
+    captions = []
+    accident_flag = False
+
+    # 4) iterate six frames
+    for off, role in zip(OFFSETS, ROLE):
+        frm = max(0, min(int(cap.get(7))-1, t+off))
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frm)
+        ok, frame = cap.read();   assert ok, f"Cannot read frame {frm}"
+        risk = float(curve.get(frm, peak_score))         # fallback
+
+        # crop only for the “peak-crop” slot
+        if role=="peak-crop":
+            log = pd.read_csv(args.risk_logs).query("frame==@t").iloc[0]
+            x0,y0,x1,y1 = (int(log[f"att1_{k}"]) for k in ("x0","y0","x1","y1"))
+            pad = 10;  x0=max(0,x0-pad); y0=max(0,y0-pad); x1=min(W,x1+pad); y1=min(H,y1+pad)
+            frame = frame[y0:y1, x0:x1]
+
+        fn = os.path.join(args.peak_dir, f"{role}_{frm}.jpg")
+        cv2.imwrite(fn, frame)
+
+        # caption
+        img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        prompt = build_prompt(role.replace("peak-",""), risk)
+        inputs = proc(images=img, text=prompt, return_tensors="pt").to(model.device)
+        out    = model.generate(**inputs, max_new_tokens=120)
+        cap_txt= proc.decode(out[0], skip_special_tokens=True).strip()
+        captions.append((role, cap_txt, risk))
+        if not is_negative_caption(cap_txt):
+            accident_flag = True
+        print(f"[{role}] {cap_txt}")
+
     cap.release()
-    if not ok:
-        raise RuntimeError(f"Cannot read frame {pf} from {args.video}")
-    H, W = frame.shape[:2]
 
-    # 3) crop or full
-    if args.full:
-        crop = frame
-        print(f"[+] Using full frame ({W}×{H})")
-    else:
-        log = pd.read_csv(args.risk_logs).query("frame==@pf").iloc[0]
-        chosen = next(i for i in (1,2,3)
-                      if abs(log[f"att{i}_score"]-ps)<1e-6)
-        x0,y0,x1,y1 = (int(log[f"att{chosen}_{c}"]) for c in ("x0","y0","x1","y1"))
-        x0s,y0s,x1s,y1s = expand_box(x0,y0,x1,y1,args.enlarge,W,H)
-        x0p = max(0, x0s-args.pad)
-        y0p = max(0, y0s-args.pad)
-        x1p = min(W, x1s+args.pad)
-        y1p = min(H, y1s+args.pad)
-        crop = frame[y0p:y1p, x0p:x1p]
-        print(f"[+] Cropped: scale×{args.enlarge}, pad={args.pad}px → {crop.shape[1]}×{crop.shape[0]}")
+    # 5) If nothing interesting → short file & exit
+    if (peak_score < args.risk_thresh) or (not accident_flag):
+        out_path = os.path.join(args.caption_dir, "no_accident.txt")
+        with open(out_path,"w") as f:
+            f.write(f"No accident detected (peak risk {peak_score:.2f}).\n")
+        print("✓ No collision – skipping LLM summary.")
+        return
 
-    # 4) upscale & sharpen
-    crop_up = upscale_crop(crop, factor=2.0)
-    crop_up = sharpen_image(crop_up)
-
-    # save as PNG
-    png_path = os.path.join(peak_dir, f"frame_{pf}.png")
-    cv2.imwrite(png_path, crop_up, [cv2.IMWRITE_PNG_COMPRESSION, 0])
-    print(f"[+] Saved PNG → {png_path}")
-
-    # resize to the model’s patch grid (384×384)
-    pil = Image.open(png_path).convert("RGB")
-    pil = pil.resize((384, 384), Image.BICUBIC)
-
-    # 5) load and run InstructBLIP on GPU if available
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[+] Loading VLM {args.vlm_model} on {device}")
-    proc  = InstructBlipProcessor.from_pretrained(
-                args.vlm_model,
-                trust_remote_code=True,
-                use_fast=True
-            )
-    model = InstructBlipForConditionalGeneration.from_pretrained(
-                args.vlm_model,
-                torch_dtype=(torch.float16 if device.type=="cuda" else torch.float32),
-                device_map=("auto" if device.type=="cuda" else None),
-                trust_remote_code=True
-            )
-    if device.type=="cpu":
-        model.to(device)
-
-    batch = proc(images=pil, text=args.prompt, return_tensors="pt").to(model.device)
-    out_ids = model.generate(
-        **batch,
-        max_new_tokens=256,
-        num_beams=8,
-        no_repeat_ngram_size=4,
-        length_penalty=1.0,
-        early_stopping=True,
-        do_sample=False,
+    # 6) build context for the LLM
+    prompt_chunks = [f"{i+1}. {r} frame: {txt}"
+                     for i,(r,txt,_) in enumerate(captions)]
+    gpt_prompt = (
+      "You are an advanced driving-assistant analyst.\n"
+      "Below are six numbered observations from a vision-language model "
+      "watching a dash-cam accident clip (frames before, during, after).\n\n"
+      + "\n".join(prompt_chunks) +
+      "\n\nTask:\n"
+      "• Briefly summarise what collision happened (vehicles, direction, point of impact).\n"
+      "• Explain the main contributing factors (speed, weather, blind spot, etc.).\n"
+      "• Give **three concrete pieces of advice** the driver could have followed "
+      "to avoid or mitigate the crash.\n"
+      "Write the answer in plain English, 2-3 short paragraphs."
     )
 
-    full   = proc.decode(out_ids[0], skip_special_tokens=True).strip()
-    prompt = args.prompt.strip()
-    caption = full[len(prompt):].strip() if full.startswith(prompt) else full
+    if args.openai_key:
+        openai.api_key = args.openai_key
+        rsp = openai.ChatCompletion.create(
+            model=args.gpt_model,
+            messages=[{"role":"user","content": gpt_prompt}],
+            max_tokens=300, temperature=0.7)
+        advice = rsp["choices"][0]["message"]["content"].strip()
+    else:
+        advice = "(LLM step skipped – set --openai_key to enable)"
 
-    # 6) write out
-    cap_path = os.path.join(cap_dir, f"caption_{pf}.txt")
-    with open(cap_path, "w", encoding="utf-8") as f:
-        f.write(caption + "\n")
-    print(f"[✓] Caption written → {cap_path}\n{caption}")
+    # 7) save everything
+    time_tag = time.strftime("%Y%m%d_%H%M%S")
+    with open(os.path.join(args.caption_dir, f"captions_{time_tag}.json"),"w") as f:
+        json.dump({"peak_score":peak_score, "captions":captions,
+                   "driver_advice":advice}, f, indent=2)
+    print("✓ Written captions + advice JSON")
 
-if __name__ == '__main__':
+if __name__=="__main__":
     main()
