@@ -2,7 +2,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 # 1) Load the CSV log
-csv_path = 'output/risk_logs/000463.csv'  # ← adjust to your path
+csv_path = 'output/risk_logs/000463.csv'
 df = pd.read_csv(csv_path)
 
 # 1a) See what the columns actually are

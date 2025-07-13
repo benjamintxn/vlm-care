@@ -16,8 +16,8 @@ def parse_args():
         description="Log per-frame risk+attention for one video"
     )
     p.add_argument('video',   help='Path to input mp4 (e.g. ./dataset/.../000469.mp4)')
-    p.add_argument('out_csv', help='Where to write the CSV log')
-    p.add_argument('--model',  default='./model/final_model',
+    p.add_argument('out_csv', default='./outputs/risk_logs/' , help='Where to write the CSV log')
+    p.add_argument('--model',  default='./model/',
                    help='Checkpoint dir or prefix')
     p.add_argument('--gpu',    default='0', help='CUDA_VISIBLE_DEVICES id')
     return p.parse_args()
